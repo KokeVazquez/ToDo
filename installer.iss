@@ -1,15 +1,15 @@
-; Script de Inno Setup para Koke's To-Do List
-#define MyAppName "Koke's To-Do List"
+; Script de Inno Setup para To-Do List
+#define MyAppName "To-Do List"
 #define MyAppVersion "1.2.0"
 #define MyAppPublisher "Jorge Vazquez"
 #define MyAppExeName "ToDo.exe"
 
 [Setup]
-AppId={{D8F91A23-4E82-4917-A109-8F7E41C35B9A}
+AppId=To-Do List
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\KokeToDo
+DefaultDirName={commonpf32}\ToDoList
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=Output
@@ -17,7 +17,8 @@ OutputBaseFilename=Instalador_ToDoList
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequiredOverridesAllowed=commandline dialog
+PrivilegesRequired=admin
+CloseApplications=yes
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -35,4 +36,3 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Filename: "{app}\{#MyAppExeName}"; Flags: nowait postinstall skipifsilent
-
