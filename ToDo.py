@@ -1,14 +1,20 @@
 # ==========================================
 # BLOQUE 1: CONFIGURACIÓN E IMPORTACIONES
 # ==========================================
+import calendar
 import json
 import os
 import subprocess
 import sys
+import threading
+import tkinter as tk
+import urllib.request
+import uuid
+import webbrowser
 from datetime import datetime, timedelta
 import customtkinter as ctk
 import winsound
-from PIL import Image
+from PIL import Image, ImageDraw
 
 try:
     from plyer import notification
@@ -17,15 +23,40 @@ try:
 except Exception:
     HAY_PLYER = False
 
+try:
+    import pystray
+
+    HAY_PYSTRAY = True
+except Exception:
+    HAY_PYSTRAY = False
+
+VERSION_ACTUAL = "1.2.0"
+
 CARPETA_DATOS = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "KokeToDo")
 os.makedirs(CARPETA_DATOS, exist_ok=True)
 
 ARCHIVO_TAREAS = os.path.join(CARPETA_DATOS, "tareas.json")
 ARCHIVO_CONFIG = os.path.join(CARPETA_DATOS, "config.json")
+
+CARPETA_STARTUP = os.path.join(
+    os.getenv("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"
+)
+ACCESO_STARTUP_VBS = os.path.join(CARPETA_STARTUP, "KokeToDoBackground.vbs")
+
 tareas = []
 secciones_abiertas = {}
-
+meses_abiertos = {}
+widgets_dias = {}
 recordatorio_actual = {"hora": "", "anticipacion": 0}
+fecha_seleccionada_nueva = {"iso": datetime.now().date().strftime("%Y-%m-%d")}
+tray_icon = None
+popup_eliminar_activo = None
+_aviso_bandeja_mostrado = False
+ultimo_dia_verificado = {"dia": None}
+modo_widget = False
+geometria_previa = "420x620"
+filtro_busqueda = ""
+busqueda_activa = False
 
 DIAS_ESPANOL = {
     0: "Lun",
@@ -35,6 +66,31 @@ DIAS_ESPANOL = {
     4: "Vie",
     5: "Sáb",
     6: "Dom",
+}
+
+DIAS_COMPLETOS = {
+    0: "Lunes",
+    1: "Martes",
+    2: "Miércoles",
+    3: "Jueves",
+    4: "Viernes",
+    5: "Sábado",
+    6: "Domingo",
+}
+
+MESES_ESPANOL = {
+    1: "Enero",
+    2: "Febrero",
+    3: "Marzo",
+    4: "Abril",
+    5: "Mayo",
+    6: "Junio",
+    7: "Julio",
+    8: "Agosto",
+    9: "Septiembre",
+    10: "Octubre",
+    11: "Noviembre",
+    12: "Diciembre",
 }
 
 TEMAS = {
@@ -106,25 +162,23 @@ TEMAS = {
 }
 
 tema_actual = "Obsidian"
-hoy_dt = datetime.now().date()
-opciones_menu = {}
 
-for i in range(14):
-    dia_obj = hoy_dt + timedelta(days=i)
-    clave_fecha = dia_obj.strftime("%Y-%m-%d")
-    nom_dia = DIAS_ESPANOL[dia_obj.weekday()]
-    formato_fecha = f"{nom_dia} {dia_obj.strftime('%d/%m')}"
 
-    if i == 0:
-        etiqueta = f"Hoy ({formato_fecha})"
-    elif i == 1:
-        etiqueta = f"Mañana ({formato_fecha})"
-    else:
-        etiqueta = formato_fecha
-
-    opciones_menu[etiqueta] = clave_fecha
-
-lista_dias_etiquetas = list(opciones_menu.keys())
+def obtener_texto_boton_fecha(fecha_iso):
+    hoy_d = datetime.now().date()
+    try:
+        f = datetime.strptime(fecha_iso, "%Y-%m-%d").date()
+        dias_dif = (f - hoy_d).days
+        nom_d = DIAS_ESPANOL[f.weekday()]
+        fmt = f.strftime("%d/%m")
+        if dias_dif == 0:
+            return f"📅 Hoy ({nom_d} {fmt})"
+        elif dias_dif == 1:
+            return f"📅 Mañana ({nom_d} {fmt})"
+        else:
+            return f"📅 {nom_d} {fmt}"
+    except Exception:
+        return "📅 Elegir Fecha"
 
 
 def resource_path(relative_path):
@@ -141,6 +195,30 @@ def obtener_ruta_imagen_kitty():
         if os.path.exists(p):
             return p
     return None
+
+
+# ==========================================
+# INICIO CON WINDOWS (SEGUNDO PLANO)
+# ==========================================
+def esta_en_inicio_windows():
+    return os.path.exists(ACCESO_STARTUP_VBS)
+
+
+def configurar_inicio_windows(activar: bool):
+    try:
+        if activar:
+            pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+            script_path = os.path.abspath(__file__)
+            vbs_content = f'CreateObject("Wscript.Shell").Run """{pythonw}"" ""{script_path}"" --tray", 0, False\n'
+            os.makedirs(CARPETA_STARTUP, exist_ok=True)
+            with open(ACCESO_STARTUP_VBS, "w", encoding="utf-8") as f:
+                f.write(vbs_content)
+        else:
+            if os.path.exists(ACCESO_STARTUP_VBS):
+                os.remove(ACCESO_STARTUP_VBS)
+        return True
+    except Exception:
+        return False
 
 
 # ==========================================
@@ -181,12 +259,16 @@ def cargar_configuracion():
 
 
 def cargar_tareas():
+    global tareas
     if os.path.exists(ARCHIVO_TAREAS):
         try:
             with open(ARCHIVO_TAREAS, "r", encoding="utf-8") as f:
                 datos = json.load(f)
                 tareas.clear()
-                tareas.extend(datos)
+                for item in datos:
+                    if "id" not in item:
+                        item["id"] = uuid.uuid4().hex[:8]
+                    tareas.append(item)
         except Exception:
             tareas.clear()
     else:
@@ -200,6 +282,7 @@ def guardar_tareas():
 
 def agregar_tarea(nombre, fecha, hora="", anticipacion=0):
     nueva_tarea = {
+        "id": uuid.uuid4().hex[:8],
         "nombre": nombre,
         "categoria": "General",
         "fecha": fecha,
@@ -210,22 +293,531 @@ def agregar_tarea(nombre, fecha, hora="", anticipacion=0):
     }
     tareas.append(nueva_tarea)
     guardar_tareas()
+    return nueva_tarea
 
 
-def alternar_tarea(nombre_tarea):
+def alternar_tarea(tarea_id):
     for t in tareas:
-        if t["nombre"] == nombre_tarea:
+        if t.get("id") == tarea_id:
             t["completada"] = not t["completada"]
             guardar_tareas()
             break
 
 
-def eliminar_tarea(nombre_tarea):
-    for i, t in enumerate(tareas):
-        if t["nombre"] == nombre_tarea:
-            tareas.pop(i)
-            guardar_tareas()
-            break
+def eliminar_tarea(tarea_id):
+    global tareas
+    tareas = [t for t in tareas if t.get("id") != tarea_id]
+    guardar_tareas()
+
+
+# ==========================================
+# POPUP CONTEXTUAL: PRIORIDADES Y ELIMINAR
+# ==========================================
+def mostrar_popup_eliminar(event, task):
+    """Muestra un popup minimalista flotante con selector de prioridad y opción de eliminar."""
+    global popup_eliminar_activo
+    if popup_eliminar_activo:
+        try:
+            popup_eliminar_activo.destroy()
+        except Exception:
+            pass
+        popup_eliminar_activo = None
+
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    popup = ctk.CTkToplevel(app)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    popup_eliminar_activo = popup
+
+    ancho_p, alto_p = 168, 92
+    x = min(event.x_root, app.winfo_screenwidth() - ancho_p - 10)
+    y = min(event.y_root, app.winfo_screenheight() - alto_p - 10)
+    popup.geometry(f"{ancho_p}x{alto_p}+{x}+{y}")
+    popup.configure(fg_color=t["bg_card"])
+
+    marco = ctk.CTkFrame(
+        popup,
+        fg_color=t["bg_card"],
+        border_width=1,
+        border_color=t.get("border_card", "#2C2C2C"),
+        corner_radius=8,
+    )
+    marco.pack(fill="both", expand=True, padx=2, pady=2)
+
+    # Selector de Prioridad (Rojo / Amarillo / Verde)
+    ctk.CTkLabel(
+        marco,
+        text="Prioridad:",
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=10, weight="bold"),
+        text_color=t["text_muted"],
+    ).pack(anchor="w", padx=8, pady=(4, 2))
+
+    fila_prio = ctk.CTkFrame(marco, fg_color="transparent")
+    fila_prio.pack(fill="x", padx=6, pady=(0, 4))
+
+    def cambiar_prioridad(prio_val):
+        global popup_eliminar_activo
+        if popup_eliminar_activo:
+            try:
+                popup_eliminar_activo.destroy()
+            except Exception:
+                pass
+            popup_eliminar_activo = None
+        task["prioridad"] = prio_val
+        guardar_tareas()
+        actualizar_lista()
+
+    prio_actual = task.get("prioridad", "verde")
+
+    btn_rojo = ctk.CTkButton(
+        fila_prio,
+        text="🔴 Alta",
+        width=46,
+        height=22,
+        corner_radius=5,
+        fg_color="#3B151A" if prio_actual == "rojo" else "transparent",
+        hover_color="#501820",
+        border_width=1 if prio_actual == "rojo" else 0,
+        border_color="#EF4444",
+        text_color="#F87171",
+        font=ctk.CTkFont(size=10, weight="bold"),
+        command=lambda: cambiar_prioridad("rojo"),
+    )
+    btn_rojo.pack(side="left", padx=1, expand=True, fill="x")
+    btn_rojo.bind("<Button-1>", lambda e: cambiar_prioridad("rojo"))
+
+    btn_amarillo = ctk.CTkButton(
+        fila_prio,
+        text="🟡 Med",
+        width=46,
+        height=22,
+        corner_radius=5,
+        fg_color="#38250B" if prio_actual == "amarillo" else "transparent",
+        hover_color="#4D320E",
+        border_width=1 if prio_actual == "amarillo" else 0,
+        border_color="#F59E0B",
+        text_color="#FBBF24",
+        font=ctk.CTkFont(size=10, weight="bold"),
+        command=lambda: cambiar_prioridad("amarillo"),
+    )
+    btn_amarillo.pack(side="left", padx=1, expand=True, fill="x")
+    btn_amarillo.bind("<Button-1>", lambda e: cambiar_prioridad("amarillo"))
+
+    btn_verde = ctk.CTkButton(
+        fila_prio,
+        text="🟢 Normal",
+        width=46,
+        height=22,
+        corner_radius=5,
+        fg_color="#0F291E" if prio_actual == "verde" else "transparent",
+        hover_color="#14382A",
+        border_width=1 if prio_actual == "verde" else 0,
+        border_color="#10B981",
+        text_color="#34D399",
+        font=ctk.CTkFont(size=10, weight="bold"),
+        command=lambda: cambiar_prioridad("verde"),
+    )
+    btn_verde.pack(side="left", padx=1, expand=True, fill="x")
+    btn_verde.bind("<Button-1>", lambda e: cambiar_prioridad("verde"))
+
+    # Separador horizontal sutil
+    ctk.CTkFrame(marco, height=1, fg_color=t.get("border_card", "#2C2C2C")).pack(
+        fill="x", padx=6, pady=2
+    )
+
+    def accion_eliminar(e=None):
+        global popup_eliminar_activo
+        if popup_eliminar_activo:
+            try:
+                popup_eliminar_activo.destroy()
+            except Exception:
+                pass
+            popup_eliminar_activo = None
+        tid = task.get("id")
+        eliminar_tarea(tid)
+        actualizar_lista()
+
+    btn_del = ctk.CTkButton(
+        marco,
+        text="🗑️  Eliminar tarea",
+        height=24,
+        corner_radius=5,
+        fg_color="transparent",
+        hover_color="#374151",
+        text_color=t.get("badge_alert", "#F87171"),
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+        command=accion_eliminar,
+    )
+    btn_del.pack(fill="x", padx=4, pady=(1, 3))
+    btn_del.bind("<Button-1>", accion_eliminar)
+
+    def verificar_click_fuera(e):
+        global popup_eliminar_activo
+        if not popup_eliminar_activo:
+            return
+        try:
+            px = popup_eliminar_activo.winfo_rootx()
+            py = popup_eliminar_activo.winfo_rooty()
+            pw = popup_eliminar_activo.winfo_width()
+            ph = popup_eliminar_activo.winfo_height()
+            if not (px <= e.x_root <= px + pw and py <= e.y_root <= py + ph):
+                popup_eliminar_activo.destroy()
+                popup_eliminar_activo = None
+        except Exception:
+            pass
+
+    app.bind_all("<Button-1>", verificar_click_fuera, add="+")
+    popup.bind("<Escape>", lambda e: popup.destroy())
+
+
+# ==========================================
+# CALENDARIO INTERACTIVO (POPUP)
+# ==========================================
+def abrir_selector_calendario(callback, fecha_inicial=None):
+    """Muestra un calendario interactivo en un popup para seleccionar cualquier día."""
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    cal_modal = ctk.CTkToplevel(app)
+    cal_modal.title("Seleccionar Fecha")
+    cal_modal.transient(app)
+    cal_modal.attributes("-topmost", True)
+    cal_modal.grab_set()
+
+    ancho_c, alto_c = 300, 320
+    pos_x = max(10, app.winfo_x() + int((app.winfo_width() - ancho_c) / 2))
+    pos_y = max(10, app.winfo_y() + int((app.winfo_height() - alto_c) / 2))
+    cal_modal.geometry(f"{ancho_c}x{alto_c}+{pos_x}+{pos_y}")
+    cal_modal.configure(fg_color=t["bg_card"])
+    cal_modal.resizable(False, False)
+
+    try:
+        dt_ini = (
+            datetime.strptime(fecha_inicial, "%Y-%m-%d").date()
+            if fecha_inicial
+            else datetime.now().date()
+        )
+    except Exception:
+        dt_ini = datetime.now().date()
+
+    estado_cal = {
+        "anio": dt_ini.year,
+        "mes": dt_ini.month,
+        "sel": dt_ini,
+    }
+
+    frame_nav = ctk.CTkFrame(cal_modal, fg_color="transparent")
+    frame_nav.pack(fill="x", padx=12, pady=(10, 4))
+
+    def cambiar_mes(delta):
+        nuevo_mes = estado_cal["mes"] + delta
+        if nuevo_mes > 12:
+            estado_cal["anio"] += 1
+            estado_cal["mes"] = 1
+        elif nuevo_mes < 1:
+            estado_cal["anio"] -= 1
+            estado_cal["mes"] = 12
+        else:
+            estado_cal["mes"] = nuevo_mes
+        renderizar_mes()
+
+    btn_ant = ctk.CTkButton(
+        frame_nav,
+        text="◀",
+        width=28,
+        height=26,
+        corner_radius=5,
+        fg_color=t["bg_app"],
+        text_color=t["text_main"],
+        hover_color=t["border_card"],
+        command=lambda: cambiar_mes(-1),
+    )
+    btn_ant.pack(side="left")
+
+    lbl_mes_anio = ctk.CTkLabel(
+        frame_nav,
+        text="",
+        font=ctk.CTkFont(family="Segoe UI Variable Display", size=13, weight="bold"),
+        text_color=t["text_main"],
+    )
+    lbl_mes_anio.pack(side="left", expand=True)
+
+    btn_sig = ctk.CTkButton(
+        frame_nav,
+        text="▶",
+        width=28,
+        height=26,
+        corner_radius=5,
+        fg_color=t["bg_app"],
+        text_color=t["text_main"],
+        hover_color=t["border_card"],
+        command=lambda: cambiar_mes(1),
+    )
+    btn_sig.pack(side="right")
+
+    frame_dias_sem = ctk.CTkFrame(cal_modal, fg_color="transparent")
+    frame_dias_sem.pack(fill="x", padx=10, pady=(4, 2))
+    dias_cortos = ["Lu", "Ma", "Mi", "Ju", "Vi", "Sá", "Do"]
+    for dc in dias_cortos:
+        ctk.CTkLabel(
+            frame_dias_sem,
+            text=dc,
+            width=38,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=t["text_muted"],
+        ).pack(side="left", padx=1)
+
+    frame_grid = ctk.CTkFrame(cal_modal, fg_color="transparent")
+    frame_grid.pack(padx=10, pady=(2, 6))
+
+    def elegir_dia(dia_num):
+        f_res = f"{estado_cal['anio']:04d}-{estado_cal['mes']:02d}-{dia_num:02d}"
+        callback(f_res)
+        cal_modal.destroy()
+
+    hoy_real = datetime.now().date()
+
+    def renderizar_mes():
+        for w in frame_grid.winfo_children():
+            w.destroy()
+
+        nom_m = MESES_ESPANOL[estado_cal["mes"]]
+        lbl_mes_anio.configure(text=f"{nom_m.upper()} {estado_cal['anio']}")
+
+        semanas = calendar.monthcalendar(estado_cal["anio"], estado_cal["mes"])
+        color_acento = "#10B981" if tema_actual != "Hello Kitty" else "#EC4899"
+
+        for sem in semanas:
+            f_fila = ctk.CTkFrame(frame_grid, fg_color="transparent")
+            f_fila.pack(pady=1)
+            for d in sem:
+                if d == 0:
+                    lbl_espacio = ctk.CTkLabel(f_fila, text="", width=38, height=24)
+                    lbl_espacio.pack(side="left", padx=1)
+                else:
+                    es_hoy = (
+                        estado_cal["anio"] == hoy_real.year
+                        and estado_cal["mes"] == hoy_real.month
+                        and d == hoy_real.day
+                    )
+                    es_sel = (
+                        estado_cal["anio"] == estado_cal["sel"].year
+                        and estado_cal["mes"] == estado_cal["sel"].month
+                        and d == estado_cal["sel"].day
+                    )
+
+                    fg_b = (
+                        color_acento
+                        if es_sel
+                        else ("transparent" if not es_hoy else t["border_card"])
+                    )
+                    txt_b = (
+                        "#FFFFFF"
+                        if es_sel
+                        else (color_acento if es_hoy else t["text_main"])
+                    )
+
+                    b_dia = ctk.CTkButton(
+                        f_fila,
+                        text=str(d),
+                        width=38,
+                        height=24,
+                        corner_radius=6,
+                        fg_color=fg_b,
+                        text_color=txt_b,
+                        hover_color=t["border_card"],
+                        font=ctk.CTkFont(
+                            size=11, weight="bold" if (es_hoy or es_sel) else "normal"
+                        ),
+                        command=lambda dn=d: elegir_dia(dn),
+                    )
+                    b_dia.pack(side="left", padx=1)
+
+    renderizar_mes()
+
+    btn_hoy = ctk.CTkButton(
+        cal_modal,
+        text="📅 Ir a Hoy",
+        height=26,
+        corner_radius=6,
+        fg_color=t["bg_app"],
+        text_color=t["text_muted"],
+        hover_color=t["border_card"],
+        font=ctk.CTkFont(size=11),
+        command=lambda: (
+            callback(hoy_real.strftime("%Y-%m-%d")),
+            cal_modal.destroy(),
+        ),
+    )
+    btn_hoy.pack(fill="x", padx=16, pady=(2, 8))
+
+
+# ==========================================
+# VENTANA DE HISTORIAL DE COMPLETADAS (POR MES Y DÍA)
+# ==========================================
+def abrir_ventana_completadas():
+    """Abre la ventana dedicada a tareas completadas organizadas por mes y día."""
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    ventana_comp = ctk.CTkToplevel(app)
+    ventana_comp.title("Historial de Tareas Completadas")
+    ventana_comp.transient(app)
+    ventana_comp.attributes("-topmost", True)
+
+    ancho_vc, alto_vc = 420, 580
+    pos_x = max(10, app.winfo_x() + int((app.winfo_width() - ancho_vc) / 2))
+    pos_y = max(10, app.winfo_y() + int((app.winfo_height() - alto_vc) / 2))
+    ventana_comp.geometry(f"{ancho_vc}x{alto_vc}+{pos_x}+{pos_y}")
+    ventana_comp.configure(fg_color=t["bg_app"])
+
+    head = ctk.CTkFrame(ventana_comp, fg_color="transparent")
+    head.pack(fill="x", padx=18, pady=(16, 8))
+
+    tareas_comp = [tk for tk in tareas if tk.get("completada")]
+    total_comp = len(tareas_comp)
+
+    ctk.CTkLabel(
+        head,
+        text="✓ Tareas Completadas",
+        font=ctk.CTkFont(family="Segoe UI Variable Display", size=16, weight="bold"),
+        text_color=t.get("badge_ok", "#34D399"),
+    ).pack(side="left")
+
+    lbl_badge_top = ctk.CTkLabel(
+        head,
+        text=f"{total_comp} lista{'s' if total_comp != 1 else ''}",
+        font=ctk.CTkFont(size=11, weight="bold"),
+        text_color=t["text_muted"],
+    )
+    lbl_badge_top.pack(side="right")
+
+    scroll_comp = ctk.CTkScrollableFrame(
+        ventana_comp,
+        fg_color=t["bg_app"],
+        corner_radius=12,
+    )
+    scroll_comp.pack(fill="both", expand=True, padx=14, pady=(4, 10))
+
+    if not tareas_comp:
+        ctk.CTkLabel(
+            scroll_comp,
+            text="Aún no has completado tareas ✨",
+            font=ctk.CTkFont(size=13),
+            text_color=t["text_muted"],
+        ).pack(pady=70)
+        return
+
+    # Agrupar por mes y luego por día
+    meses_comp = {}
+    for tk in tareas_comp:
+        f_str = tk.get("fecha", "")
+        try:
+            dt_f = datetime.strptime(f_str, "%Y-%m-%d").date()
+            clave_m = dt_f.strftime("%Y-%m")
+            nom_m = MESES_ESPANOL[dt_f.month].upper()
+            nombre_m = f"{nom_m} {dt_f.year}"
+        except Exception:
+            clave_m = "9999-99"
+            nombre_m = "OTRAS FECHAS"
+
+        if clave_m not in meses_comp:
+            meses_comp[clave_m] = {"nombre": nombre_m, "dias": {}}
+
+        if f_str not in meses_comp[clave_m]["dias"]:
+            etiqueta_d, _ = obtener_etiqueta_dinamica(f_str)
+            meses_comp[clave_m]["dias"][f_str] = {
+                "etiqueta": etiqueta_d.replace("⚠️ ", "")
+                .replace(" (Atrasado)", "")
+                .replace("Hoy • ", "")
+                .replace("Mañana • ", ""),
+                "tareas": [],
+            }
+        meses_comp[clave_m]["dias"][f_str]["tareas"].append(tk)
+
+    for clave_m, d_mes in sorted(meses_comp.items(), key=lambda x: x[0], reverse=True):
+        banner_m = ctk.CTkFrame(scroll_comp, fg_color="transparent")
+        banner_m.pack(fill="x", pady=(10, 4), padx=2)
+
+        ctk.CTkLabel(
+            banner_m,
+            text=f"🗓️ {d_mes['nombre']}",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=t["text_main"],
+        ).pack(side="left", padx=(4, 8))
+
+        ctk.CTkFrame(banner_m, height=1, fg_color=t["border_card"]).pack(
+            side="left", fill="x", expand=True, padx=(4, 8)
+        )
+
+        for f_dia, d_dia in sorted(
+            d_mes["dias"].items(), key=lambda x: x[0], reverse=True
+        ):
+            secc_d = ctk.CTkFrame(
+                scroll_comp,
+                fg_color=t["bg_card"],
+                corner_radius=10,
+                border_width=1,
+                border_color=t["border_card"],
+            )
+            secc_d.pack(fill="x", pady=4, padx=4)
+
+            h_d = ctk.CTkFrame(secc_d, fg_color="transparent")
+            h_d.pack(fill="x", padx=10, pady=(6, 4))
+            ctk.CTkLabel(
+                h_d,
+                text=d_dia["etiqueta"],
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=t["text_muted"],
+            ).pack(side="left")
+
+            for task in d_dia["tareas"]:
+                caps = ctk.CTkFrame(
+                    secc_d,
+                    fg_color=t["bg_input"],
+                    corner_radius=8,
+                    border_width=1,
+                    border_color=t["border_input"],
+                    cursor="hand2",
+                )
+                caps.pack(fill="x", pady=2, padx=6)
+
+                tid = task.get("id")
+
+                def desmarcar(tid_val=tid):
+                    alternar_tarea(tid_val)
+                    actualizar_lista()
+                    ventana_comp.destroy()
+                    abrir_ventana_completadas()
+
+                cb = ctk.CTkCheckBox(
+                    caps,
+                    text="",
+                    width=20,
+                    checkbox_width=18,
+                    checkbox_height=18,
+                    corner_radius=9,
+                    fg_color="#10B981" if tema_actual != "Hello Kitty" else "#EC4899",
+                    command=desmarcar,
+                )
+                cb.select()
+                cb.pack(side="left", padx=(8, 4), pady=6)
+
+                lbl_t = ctk.CTkLabel(
+                    caps,
+                    text=task.get("nombre", ""),
+                    anchor="w",
+                    justify="left",
+                    wraplength=260,
+                    text_color="#6B7280",
+                    font=ctk.CTkFont(size=12, slant="italic"),
+                )
+                lbl_t.pack(side="left", fill="x", expand=True, padx=4, pady=6)
+
+                caps.bind(
+                    "<Button-3>",
+                    lambda event, tk_item=task: mostrar_popup_eliminar(event, tk_item),
+                )
+                lbl_t.bind(
+                    "<Button-3>",
+                    lambda event, tk_item=task: mostrar_popup_eliminar(event, tk_item),
+                )
 
 
 # ==========================================
@@ -245,86 +837,133 @@ def obtener_imagen_tenue(ruta_img, opacidad=0.18, tamano=(200, 200)):
         return None
 
 
-def mostrar_alerta_modal(tarea_nombre, detalle_hora):
+def mostrar_alerta_modal(tarea_nombre, detalle_hora, tarea=None):
     try:
         winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
     except Exception:
         pass
 
-    modal_alerta = ctk.CTkToplevel(app)
+    modal_alerta = ctk.CTkToplevel()
     modal_alerta.title("¡RECORDATORIO!")
-    modal_alerta.transient(app)
     modal_alerta.attributes("-topmost", True)
-    modal_alerta.grab_set()
 
-    ancho_a, alto_a = 320, 230
-    pos_x = app.winfo_x() + int((app.winfo_width() - ancho_a) / 2)
-    pos_y = app.winfo_y() + int((app.winfo_height() - alto_a) / 2)
+    ancho_a, alto_a = 340, 240
+    sw = modal_alerta.winfo_screenwidth()
+    sh = modal_alerta.winfo_screenheight()
+    pos_x = max(10, int((sw - ancho_a) / 2))
+    pos_y = max(10, int((sh - alto_a) / 2))
     modal_alerta.geometry(f"{ancho_a}x{alto_a}+{pos_x}+{pos_y}")
     modal_alerta.resizable(False, False)
 
     if tema_actual == "Hello Kitty":
         bg_banner = "#E11D48"
-        bg_card = "#F472B6"
+        bg_card = "#FCE7F3"
         txt_main = "#831843"
         txt_sub = "#500724"
-        btn_bg = "#831843"
-        btn_hover = "#500724"
+        btn_bg = "#EC4899"
+        btn_hover = "#DB2777"
         btn_txt = "#FFFFFF"
     else:
-        bg_banner = "#D97706"
-        bg_card = "#F59E0B"
-        txt_main = "#1C1917"
-        txt_sub = "#451A03"
-        btn_bg = "#1C1917"
-        btn_hover = "#292524"
+        bg_banner = "#10B981"
+        bg_card = "#161920"
+        txt_main = "#F9FAFB"
+        txt_sub = "#9CA3AF"
+        btn_bg = "#10B981"
+        btn_hover = "#059669"
         btn_txt = "#FFFFFF"
 
     modal_alerta.configure(fg_color=bg_card)
 
-    banner = ctk.CTkFrame(modal_alerta, fg_color=bg_banner, height=40, corner_radius=0)
+    banner = ctk.CTkFrame(modal_alerta, fg_color=bg_banner, height=36, corner_radius=0)
     banner.pack(fill="x")
     ctk.CTkLabel(
         banner,
-        text="🔔  ¡RECORDATORIO ACTIVO!",
+        text="🔔  ¡RECORDATORIO!",
         font=ctk.CTkFont(family="Segoe UI Variable Display", size=13, weight="bold"),
         text_color="#FFFFFF",
-    ).pack(pady=8)
+    ).pack(pady=7)
 
     cuerpo = ctk.CTkFrame(modal_alerta, fg_color="transparent")
-    cuerpo.pack(fill="both", expand=True, padx=20, pady=8)
+    cuerpo.pack(fill="both", expand=True, padx=18, pady=8)
 
     ctk.CTkLabel(
         cuerpo,
         text=tarea_nombre,
-        font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"),
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=15, weight="bold"),
         text_color=txt_main,
-        wraplength=270,
+        wraplength=300,
         justify="center",
     ).pack(expand=True)
 
     ctk.CTkLabel(
         cuerpo,
         text=detalle_hora,
-        font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=11),
         text_color=txt_sub,
-    ).pack(pady=(0, 4))
+    ).pack(pady=(0, 6))
+
+    fila_botones = ctk.CTkFrame(modal_alerta, fg_color="transparent")
+    fila_botones.pack(fill="x", padx=16, pady=(0, 14))
+
+    def marcar_lista():
+        if tarea:
+            tarea["completada"] = True
+            guardar_tareas()
+            actualizar_lista()
+        modal_alerta.destroy()
+
+    def posponer_5():
+        if tarea:
+            ahora_m5 = datetime.now() + timedelta(minutes=5)
+            tarea["hora"] = ahora_m5.strftime("%H:%M")
+            tarea["fecha"] = ahora_m5.strftime("%Y-%m-%d")
+            tarea["notificado"] = False
+            guardar_tareas()
+            actualizar_lista()
+        modal_alerta.destroy()
+
+    if tarea:
+        ctk.CTkButton(
+            fila_botones,
+            text="✓ Lista",
+            width=80,
+            height=32,
+            corner_radius=8,
+            fg_color=btn_bg,
+            hover_color=btn_hover,
+            text_color=btn_txt,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=marcar_lista,
+        ).pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        ctk.CTkButton(
+            fila_botones,
+            text="💤 +5 min",
+            width=85,
+            height=32,
+            corner_radius=8,
+            fg_color="#374151",
+            hover_color="#4B5563",
+            text_color="#F3F4F6",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=posponer_5,
+        ).pack(side="left", padx=(0, 6), expand=True, fill="x")
 
     ctk.CTkButton(
-        modal_alerta,
-        text="Aceptar y Cerrar",
-        height=34,
+        fila_botones,
+        text="Cerrar",
+        width=70,
+        height=32,
         corner_radius=8,
-        fg_color=btn_bg,
-        hover_color=btn_hover,
-        text_color=btn_txt,
-        font=ctk.CTkFont(size=12, weight="bold"),
+        fg_color="transparent",
+        hover_color="#2D333E",
+        text_color=txt_sub,
+        font=ctk.CTkFont(size=11),
         command=modal_alerta.destroy,
-    ).pack(fill="x", padx=20, pady=(0, 14))
+    ).pack(side="left", expand=True, fill="x")
 
 
-def lanzar_notificacion(titulo, mensaje):
-    mostrar_alerta_modal(titulo.replace("🔔 ", ""), mensaje)
+def lanzar_notificacion(titulo, mensaje, tarea=None):
     if HAY_PLYER:
         try:
             notification.notify(
@@ -336,9 +975,184 @@ def lanzar_notificacion(titulo, mensaje):
         except Exception:
             pass
 
+    # SOLO muestra el popup del recordatorio (NO restaura la ventana principal)
+    mostrar_alerta_modal(
+        titulo.replace("🔔 ", "").replace("⏰ ", ""),
+        mensaje,
+        tarea=tarea,
+    )
+
+
+# ==========================================
+# SISTEMA DE AUTO-ACTUALIZACIÓN
+# ==========================================
+def mostrar_modal_actualizacion(info_update):
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    modal = ctk.CTkToplevel()
+    modal.title("Actualización disponible")
+    modal.attributes("-topmost", True)
+    ancho, alto = 340, 260
+    sw = modal.winfo_screenwidth()
+    sh = modal.winfo_screenheight()
+    modal.geometry(f"{ancho}x{alto}+{int((sw-ancho)/2)}+{int((sh-alto)/2)}")
+    modal.configure(fg_color=t["bg_card"])
+    modal.resizable(False, False)
+
+    v_remota = info_update.get("version", "Nueva")
+    novedades = info_update.get("novedades", "• Mejoras generales y correcciones.")
+    url_descarga = info_update.get("url_descarga", "")
+
+    banner = ctk.CTkFrame(
+        modal,
+        fg_color="#10B981" if tema_actual != "Hello Kitty" else "#EC4899",
+        height=38,
+        corner_radius=0,
+    )
+    banner.pack(fill="x")
+    ctk.CTkLabel(
+        banner,
+        text=f"🚀  ¡Nueva versión {v_remota} disponible!",
+        font=ctk.CTkFont(family="Segoe UI Variable Display", size=13, weight="bold"),
+        text_color="#FFFFFF",
+    ).pack(pady=8)
+
+    cuerpo = ctk.CTkFrame(modal, fg_color="transparent")
+    cuerpo.pack(fill="both", expand=True, padx=18, pady=10)
+
+    ctk.CTkLabel(
+        cuerpo,
+        text=f"Tu versión actual es v{VERSION_ACTUAL}. Novedades:",
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+        text_color=t["text_main"],
+        anchor="w",
+    ).pack(fill="x")
+
+    lbl_nov = ctk.CTkLabel(
+        cuerpo,
+        text=novedades,
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=11),
+        text_color=t["text_muted"],
+        justify="left",
+        anchor="w",
+        wraplength=300,
+    )
+    lbl_nov.pack(fill="x", pady=(4, 8))
+
+    def descargar():
+        if url_descarga:
+            webbrowser.open(url_descarga)
+        modal.destroy()
+
+    ctk.CTkButton(
+        modal,
+        text="📥 Descargar actualización",
+        height=32,
+        corner_radius=8,
+        fg_color="#10B981" if tema_actual != "Hello Kitty" else "#EC4899",
+        hover_color="#059669" if tema_actual != "Hello Kitty" else "#DB2777",
+        font=ctk.CTkFont(size=12, weight="bold"),
+        command=descargar,
+    ).pack(fill="x", padx=18, pady=(0, 6))
+
+    ctk.CTkButton(
+        modal,
+        text="Más tarde",
+        height=26,
+        corner_radius=8,
+        fg_color="transparent",
+        hover_color=t["border_card"],
+        text_color=t["text_muted"],
+        font=ctk.CTkFont(size=11),
+        command=modal.destroy,
+    ).pack(fill="x", padx=18, pady=(0, 12))
+
+
+def _modal_aviso_info(titulo, mensaje):
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    m = ctk.CTkToplevel()
+    m.title(titulo)
+    m.attributes("-topmost", True)
+    ancho, alto = 280, 140
+    sw = m.winfo_screenwidth()
+    sh = m.winfo_screenheight()
+    m.geometry(f"{ancho}x{alto}+{int((sw-ancho)/2)}+{int((sh-alto)/2)}")
+    m.configure(fg_color=t["bg_card"])
+    m.resizable(False, False)
+
+    ctk.CTkLabel(
+        m,
+        text=titulo,
+        font=ctk.CTkFont(size=13, weight="bold"),
+        text_color=t["text_main"],
+    ).pack(pady=(16, 6))
+    ctk.CTkLabel(
+        m,
+        text=mensaje,
+        font=ctk.CTkFont(size=11),
+        text_color=t["text_muted"],
+        wraplength=240,
+        justify="center",
+    ).pack(pady=(0, 12))
+    ctk.CTkButton(
+        m,
+        text="Entendido",
+        height=28,
+        corner_radius=6,
+        command=m.destroy,
+        fg_color="#374151",
+    ).pack(padx=20)
+
+
+def parse_version(v):
+    try:
+        return [int(x) for x in str(v).strip().lstrip("v").split(".")]
+    except Exception:
+        return [0, 0, 0]
+
+
+def verificar_actualizaciones(mostrar_si_al_dia=False):
+    def _tarea_check():
+        url_version = "https://raw.githubusercontent.com/KokeVazquez/ToDo/main/version.json"
+        try:
+            req = urllib.request.Request(
+                url_version, headers={"User-Agent": "KokeToDo-App"}
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    remota = data.get("version", "1.0.0")
+                    if parse_version(remota) > parse_version(VERSION_ACTUAL):
+                        app.after(0, lambda: mostrar_modal_actualizacion(data))
+                    elif mostrar_si_al_dia:
+                        app.after(
+                            0,
+                            lambda: _modal_aviso_info(
+                                "Estás al día ✨",
+                                f"Tienes la versión más reciente (v{VERSION_ACTUAL}).",
+                            ),
+                        )
+        except Exception:
+            if mostrar_si_al_dia:
+                app.after(
+                    0,
+                    lambda: _modal_aviso_info(
+                        "Sin conexión",
+                        "No se pudo comprobar si hay actualizaciones en este momento.",
+                    ),
+                )
+
+    threading.Thread(target=_tarea_check, daemon=True).start()
+
 
 def verificar_recordatorios():
     ahora = datetime.now()
+    hoy_actual = ahora.date()
+
+    if hoy_actual != ultimo_dia_verificado["dia"]:
+        ultimo_dia_verificado["dia"] = hoy_actual
+        actualizar_boton_calendario_principal()
+        actualizar_lista()
+
     cambio = False
 
     for t in tareas:
@@ -364,6 +1178,7 @@ def verificar_recordatorios():
                 lanzar_notificacion(
                     f"🔔 {t['nombre']}",
                     detalle,
+                    tarea=t,
                 )
         except Exception:
             pass
@@ -398,14 +1213,10 @@ def aplicar_tema(nombre_tema):
     )
     macro_tareas.configure(fg_color=t["bg_app"])
 
-    selector_dia.configure(
+    btn_calendario.configure(
         fg_color=t["bg_card"],
-        button_color=t["border_card"],
-        button_hover_color=t["border_input"],
-        dropdown_fg_color=t["bg_card"],
-        dropdown_hover_color=t["border_card"],
+        hover_color=t["border_card"],
         text_color=t["text_main"],
-        dropdown_text_color=t["text_main"],
     )
 
     entrada_tarea.configure(
@@ -420,6 +1231,25 @@ def aplicar_tema(nombre_tema):
         lbl_watermark.pack(side="left", expand=True)
     else:
         lbl_watermark.pack_forget()
+
+    if "btn_buscar" in globals():
+        btn_buscar.configure(
+            text_color=t.get("accent", "#60A5FA") if busqueda_activa else t["text_muted"],
+            hover_color=t.get("border_card", "#1F232B"),
+        )
+    if "marco_busqueda" in globals():
+        marco_busqueda.configure(
+            fg_color=t["bg_card"],
+            border_color=t.get("border_card", "#2C2C2C"),
+        )
+        entrada_busqueda.configure(
+            text_color=t["text_main"],
+            placeholder_text_color=t.get("placeholder", "#9CA3AF"),
+        )
+        btn_cerrar_busqueda.configure(
+            text_color=t["text_muted"],
+            hover_color=t.get("border_card", "#1F232B"),
+        )
 
     try:
         import ctypes
@@ -453,30 +1283,66 @@ def actualizar_boton_hora():
         )
 
 
-def abrir_selector_hora(tarea_a_editar=None):
+def actualizar_boton_calendario_principal():
+    btn_calendario.configure(
+        text=obtener_texto_boton_fecha(fecha_seleccionada_nueva["iso"])
+    )
+
+
+def click_calendario_principal():
+    def al_elegir(f_nueva):
+        fecha_seleccionada_nueva["iso"] = f_nueva
+        actualizar_boton_calendario_principal()
+
+    abrir_selector_calendario(al_elegir, fecha_seleccionada_nueva["iso"])
+
+
+def abrir_modal_edicion(tarea_a_editar=None):
+    """Abre el modal para editar texto, fecha (con calendario), hora y anticipación."""
     t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
     modal = ctk.CTkToplevel(app)
-    modal.title("Reprogramar Hora" if tarea_a_editar else "Definir Hora")
+    modal.title("Editar Recordatorio" if tarea_a_editar else "Definir Hora")
     modal.transient(app)
     modal.attributes("-topmost", True)
     modal.grab_set()
 
-    ancho_m, alto_m = 290, 420
-    pos_x = app.winfo_x() + int((app.winfo_width() - ancho_m) / 2)
-    pos_y = app.winfo_y() + int((app.winfo_height() - alto_m) / 2)
+    ancho_m = 320
+    alto_m = 520 if tarea_a_editar else 420
+    pos_x = max(10, app.winfo_x() + int((app.winfo_width() - ancho_m) / 2))
+    pos_y = max(10, app.winfo_y() + int((app.winfo_height() - alto_m) / 2))
     modal.geometry(f"{ancho_m}x{alto_m}+{pos_x}+{pos_y}")
     modal.configure(fg_color=t["bg_card"])
     modal.resizable(False, False)
 
-    titulo_modal = (
-        f"⏰ {tarea_a_editar['nombre'][:18]}..." if tarea_a_editar else "⏰ Elegir Hora"
-    )
+    titulo_modal = "✏️ Modificar Tarea" if tarea_a_editar else "⏰ Definir Hora"
     ctk.CTkLabel(
         modal,
         text=titulo_modal,
-        font=ctk.CTkFont(family="Segoe UI Variable Display", size=14, weight="bold"),
+        font=ctk.CTkFont(family="Segoe UI Variable Display", size=15, weight="bold"),
         text_color=t["text_main"],
-    ).pack(pady=(10, 4))
+    ).pack(pady=(12, 6))
+
+    entry_nombre_edicion = None
+    if tarea_a_editar:
+        ctk.CTkLabel(
+            modal,
+            text="Nombre de la tarea:",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=t["text_muted"],
+        ).pack(anchor="w", padx=24, pady=(2, 2))
+
+        entry_nombre_edicion = ctk.CTkEntry(
+            modal,
+            height=32,
+            corner_radius=7,
+            fg_color=t["bg_app"],
+            text_color=t["text_main"],
+            border_color=t["border_card"],
+            border_width=1,
+            font=ctk.CTkFont(size=12),
+        )
+        entry_nombre_edicion.insert(0, tarea_a_editar.get("nombre", ""))
+        entry_nombre_edicion.pack(fill="x", padx=24, pady=(0, 6))
 
     ahora_dt = datetime.now()
     hora_inicial = (
@@ -635,12 +1501,56 @@ def abrir_selector_hora(tarea_a_editar=None):
 
     modal.after(20, auto_scroll)
 
+    # SELECTOR DE FECHA CON CALENDARIO EN EL MODAL DE EDICIÓN
+    fecha_edicion = {
+        "iso": (
+            tarea_a_editar.get("fecha", datetime.now().date().strftime("%Y-%m-%d"))
+            if tarea_a_editar
+            else fecha_seleccionada_nueva["iso"]
+        )
+    }
+
+    if tarea_a_editar:
+        ctk.CTkLabel(
+            modal,
+            text="Fecha programada:",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=t["text_muted"],
+        ).pack(anchor="w", padx=24, pady=(6, 2))
+
+        def actualizar_txt_btn_edicion():
+            btn_fecha_edicion.configure(
+                text=obtener_texto_boton_fecha(fecha_edicion["iso"])
+            )
+
+        def click_cambiar_fecha_edicion():
+            def al_elegir(f_nueva):
+                fecha_edicion["iso"] = f_nueva
+                actualizar_txt_btn_edicion()
+
+            abrir_selector_calendario(al_elegir, fecha_edicion["iso"])
+
+        btn_fecha_edicion = ctk.CTkButton(
+            modal,
+            text=obtener_texto_boton_fecha(fecha_edicion["iso"]),
+            height=30,
+            corner_radius=7,
+            fg_color=t["bg_app"],
+            text_color=t["text_main"],
+            border_color=t["border_card"],
+            border_width=1,
+            hover_color=t["border_card"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=click_cambiar_fecha_edicion,
+        )
+        btn_fecha_edicion.pack(fill="x", padx=24, pady=(0, 6))
+
     ctk.CTkLabel(
         modal,
         text="Avisarme:",
-        font=ctk.CTkFont(size=11),
+        font=ctk.CTkFont(size=11, weight="bold"),
         text_color=t["text_muted"],
-    ).pack(anchor="w", padx=24, pady=(6, 2))
+    ).pack(anchor="w", padx=24, pady=(4, 2))
 
     opciones_anticipo = {
         "A la hora exacta": 0,
@@ -680,9 +1590,16 @@ def abrir_selector_hora(tarea_a_editar=None):
         ant_final = opciones_anticipo.get(menu_aviso.get(), 0)
 
         if tarea_a_editar:
+            if entry_nombre_edicion:
+                nuevo_nom = entry_nombre_edicion.get().strip()
+                if nuevo_nom:
+                    tarea_a_editar["nombre"] = nuevo_nom
+
             tarea_a_editar["hora"] = h_final
             tarea_a_editar["anticipacion"] = ant_final
             tarea_a_editar["notificado"] = False
+            tarea_a_editar["fecha"] = fecha_edicion["iso"]
+
             guardar_tareas()
             actualizar_lista()
             modal.destroy()
@@ -695,11 +1612,9 @@ def abrir_selector_hora(tarea_a_editar=None):
 
         texto = entrada_tarea.get().strip()
         if texto:
-            etiqueta_sel = selector_dia.get()
-            fecha_iso = opciones_menu.get(etiqueta_sel, hoy_dt.strftime("%Y-%m-%d"))
             agregar_tarea(
                 texto,
-                fecha_iso,
+                fecha_seleccionada_nueva["iso"],
                 hora=h_final,
                 anticipacion=ant_final,
             )
@@ -707,6 +1622,8 @@ def abrir_selector_hora(tarea_a_editar=None):
             recordatorio_actual["hora"] = ""
             recordatorio_actual["anticipacion"] = 0
             actualizar_boton_hora()
+            fecha_seleccionada_nueva["iso"] = datetime.now().date().strftime("%Y-%m-%d")
+            actualizar_boton_calendario_principal()
             actualizar_lista()
 
     def quitar_recordatorio():
@@ -725,11 +1642,11 @@ def abrir_selector_hora(tarea_a_editar=None):
     ctk.CTkButton(
         modal,
         text=(
-            "Listo"
+            "Guardar Cambios"
             if tarea_a_editar
             else ("Guardar tarea" if entrada_tarea.get().strip() else "Fijar hora")
         ),
-        height=32,
+        height=34,
         corner_radius=8,
         fg_color="#10B981" if tema_actual != "Hello Kitty" else "#EC4899",
         hover_color="#059669" if tema_actual != "Hello Kitty" else "#DB2777",
@@ -748,63 +1665,122 @@ def abrir_selector_hora(tarea_a_editar=None):
             text_color=t.get("badge_alert", "#F87171"),
             font=ctk.CTkFont(size=11),
             command=quitar_recordatorio,
-        ).pack(fill="x", padx=24, pady=(0, 10))
+        ).pack(fill="x", padx=24, pady=(0, 6))
+
+    if tarea_a_editar:
+
+        def borrar_desde_modal():
+            modal.destroy()
+            eliminar_tarea(tarea_a_editar.get("id"))
+            actualizar_lista()
+
+        ctk.CTkButton(
+            modal,
+            text="🗑️ Eliminar esta tarea",
+            height=28,
+            corner_radius=8,
+            fg_color="transparent",
+            hover_color=t["border_card"],
+            text_color=t.get("badge_alert", "#F87171"),
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=borrar_desde_modal,
+        ).pack(fill="x", padx=24, pady=(2, 10))
 
 
 def obtener_etiqueta_dinamica(fecha_str):
+    """Calcula la etiqueta del día en formato elegante."""
+    hoy = datetime.now().date()
     try:
         f = datetime.strptime(fecha_str, "%Y-%m-%d").date()
-        dias_dif = (f - hoy_dt).days
-        nom_dia = DIAS_ESPANOL[f.weekday()]
+        dias_dif = (f - hoy).days
+        nom_dia = DIAS_COMPLETOS[f.weekday()]
+        nom_mes = MESES_ESPANOL[f.month]
+        texto_fecha = f"{nom_dia} {f.day} de {nom_mes}"
 
         if dias_dif < 0:
-            return "Atrasadas", f.strftime("%Y-%m-%d")
+            return f"⚠️ {texto_fecha} (Atrasado)", f.strftime("%Y-%m-%d")
         elif dias_dif == 0:
-            return "Hoy", f.strftime("%Y-%m-%d")
+            return f"Hoy • {texto_fecha}", f.strftime("%Y-%m-%d")
         elif dias_dif == 1:
-            return "Mañana", f.strftime("%Y-%m-%d")
+            return f"Mañana • {texto_fecha}", f.strftime("%Y-%m-%d")
         else:
-            return (
-                f"{nom_dia} {f.strftime('%d')}",
-                f.strftime("%Y-%m-%d"),
-            )
+            return texto_fecha, f.strftime("%Y-%m-%d")
     except Exception:
-        return fecha_str, "9999-99-99"
+        return "Otras fechas", "9999-99-99"
 
 
-def alternar_seccion(etiqueta, card_widget=None):
-    abriendo = not secciones_abiertas.get(etiqueta, False)
-    secciones_abiertas[etiqueta] = abriendo
+def hacer_scroll_a_clave(clave):
+    """Ajusta suavemente el scroll para mostrar el encabezado de la sección recién abierta."""
+    app.update_idletasks()
+    widget = widgets_dias.get(clave)
+    if not widget:
+        return
+    try:
+        if not widget.winfo_exists():
+            return
+        canvas = macro_tareas._parent_canvas
+        bbox = canvas.bbox("all")
+        if not bbox:
+            return
+        total_h = bbox[3] - bbox[1]
+        if total_h <= 0:
+            return
+
+        canvas_y = canvas.canvasy(0)
+        w_y = widget.winfo_rooty() - canvas.winfo_rooty() + canvas_y
+        frac = max(0.0, min(1.0, (w_y - 8) / total_h))
+        canvas.yview_moveto(frac)
+    except Exception:
+        pass
+
+
+def alternar_mes(clave_mes):
+    """Alterna el estado abierto/cerrado de un mes en el primer clic."""
+    mes_actual_iso = datetime.now().strftime("%Y-%m")
+    estado_defecto = clave_mes == mes_actual_iso
+    estado_actual = meses_abiertos.get(clave_mes, estado_defecto)
+    nuevo_estado = not estado_actual
+    meses_abiertos[clave_mes] = nuevo_estado
+    actualizar_lista()
+    if nuevo_estado:
+        app.after(50, lambda: hacer_scroll_a_clave(f"mes_{clave_mes}"))
+
+
+def alternar_seccion(clave_orden, card_widget=None):
+    """Alterna el estado abierto/cerrado de un día en el primer clic y acomoda la vista."""
+    hoy_iso = datetime.now().date().strftime("%Y-%m-%d")
+    estado_defecto = clave_orden == hoy_iso
+    estado_actual = secciones_abiertas.get(clave_orden, estado_defecto)
+    nuevo_estado = not estado_actual
+    secciones_abiertas[clave_orden] = nuevo_estado
+    actualizar_lista()
+    if nuevo_estado:
+        app.after(50, lambda: hacer_scroll_a_clave(clave_orden))
+
+
+def borrar_click(tarea_id):
+    eliminar_tarea(tarea_id)
     actualizar_lista()
 
-    if abriendo and card_widget:
-        app.update_idletasks()
-        macro_tareas._parent_canvas.yview_moveto(1.0)
 
-
-def borrar_click(nombre):
-    eliminar_tarea(nombre)
-    actualizar_lista()
-
-
-def toggle_click(nombre):
-    alternar_tarea(nombre)
+def toggle_click(tarea_id):
+    alternar_tarea(tarea_id)
     actualizar_lista()
 
 
 def abrir_ajustes():
     ventana_ajustes = ctk.CTkToplevel(app)
-    ventana_ajustes.title("Ajustes")
+    ventana_ajustes.title("Configuración")
 
     ventana_ajustes.transient(app)
     ventana_ajustes.attributes("-topmost", True)
     ventana_ajustes.grab_set()
 
     app.update_idletasks()
-    ancho_aj = 310
-    alto_aj = 340
-    pos_x = app.winfo_x() + int((app.winfo_width() - ancho_aj) / 2)
-    pos_y = app.winfo_y() + int((app.winfo_height() - alto_aj) / 2)
+    ancho_aj = 330
+    alto_aj = 470
+    pos_x = max(10, app.winfo_x() + int((app.winfo_width() - ancho_aj) / 2))
+    pos_y = max(10, app.winfo_y() + int((app.winfo_height() - alto_aj) / 2))
     ventana_ajustes.geometry(f"{ancho_aj}x{alto_aj}+{pos_x}+{pos_y}")
 
     ventana_ajustes.configure(fg_color="#0F1115")
@@ -815,10 +1791,10 @@ def abrir_ajustes():
 
     ctk.CTkLabel(
         ventana_ajustes,
-        text="Configuracion",
+        text="Configuración",
         font=ctk.CTkFont(family="Segoe UI Variable Display", size=16, weight="bold"),
         text_color="#F9FAFB",
-    ).pack(pady=(16, 10))
+    ).pack(pady=(14, 8))
 
     ctk.CTkLabel(
         ventana_ajustes,
@@ -826,23 +1802,29 @@ def abrir_ajustes():
         font=ctk.CTkFont(size=12),
         text_color="#9CA3AF",
     ).pack(anchor="w", padx=24)
-    entry_nombre = ctk.CTkEntry(ventana_ajustes, height=32, corner_radius=8)
+    entry_nombre = ctk.CTkEntry(ventana_ajustes, height=30, corner_radius=8)
     entry_nombre.insert(0, nombre_usuario)
-    entry_nombre.pack(fill="x", padx=24, pady=(4, 10))
+    entry_nombre.pack(fill="x", padx=24, pady=(3, 8))
 
     ctk.CTkLabel(
         ventana_ajustes,
-        text="Tamano de ventana:",
+        text="Tamaño de ventana:",
         font=ctk.CTkFont(size=12),
         text_color="#9CA3AF",
     ).pack(anchor="w", padx=24)
     menu_tamano = ctk.CTkOptionMenu(
         ventana_ajustes,
-        values=["Compacto (400x400)", "Normal (500x650)", "Grande (1000x900)"],
+        values=[
+            "Compacto (420x480)",
+            "Normal (420x620)",
+            "Grande (600x750)",
+            "Amplio (900x800)",
+        ],
         height=30,
         corner_radius=8,
     )
-    menu_tamano.pack(fill="x", padx=24, pady=(4, 10))
+    menu_tamano.set("Normal (420x620)")
+    menu_tamano.pack(fill="x", padx=24, pady=(3, 8))
 
     ctk.CTkLabel(
         ventana_ajustes,
@@ -857,7 +1839,20 @@ def abrir_ajustes():
         corner_radius=8,
     )
     menu_tema.set(tema_actual)
-    menu_tema.pack(fill="x", padx=24, pady=(4, 16))
+    menu_tema.pack(fill="x", padx=24, pady=(3, 10))
+
+    chk_startup = ctk.CTkCheckBox(
+        ventana_ajustes,
+        text="Iniciar en segundo plano con Windows",
+        font=ctk.CTkFont(size=11),
+        text_color="#D1D5DB",
+        checkbox_width=18,
+        checkbox_height=18,
+        corner_radius=4,
+    )
+    if esta_en_inicio_windows():
+        chk_startup.select()
+    chk_startup.pack(anchor="w", padx=24, pady=(4, 14))
 
     def guardar_ajustes():
         global nombre_usuario
@@ -866,18 +1861,26 @@ def abrir_ajustes():
 
         seleccion = menu_tamano.get()
         if "Compacto" in seleccion:
-            app.geometry("400x400")
+            app.geometry("420x480")
         elif "Grande" in seleccion:
-            app.geometry("1000x900")
+            app.geometry("600x750")
+        elif "Amplio" in seleccion:
+            app.geometry("900x800")
         else:
-            app.geometry("500x650")
+            app.geometry("420x620")
 
         nuevo_tema = menu_tema.get()
         aplicar_tema(nuevo_tema)
 
+        configurar_inicio_windows(chk_startup.get() == 1)
+
         with open(ARCHIVO_CONFIG, "w", encoding="utf-8") as f:
             json.dump(
-                {"nombre": nuevo_nombre, "tema": nuevo_tema},
+                {
+                    "nombre": nuevo_nombre,
+                    "tema": nuevo_tema,
+                    "inicio_windows": (chk_startup.get() == 1),
+                },
                 f,
                 indent=4,
                 ensure_ascii=False,
@@ -888,24 +1891,45 @@ def abrir_ajustes():
 
     ctk.CTkButton(
         ventana_ajustes,
-        text="Guardar",
+        text="Guardar Cambios",
         command=guardar_ajustes,
         fg_color="#10B981",
         hover_color="#059669",
         height=32,
         corner_radius=8,
+    ).pack(fill="x", padx=24, pady=(0, 6))
+
+    ctk.CTkButton(
+        ventana_ajustes,
+        text=f"🔄 Buscar actualizaciones (v{VERSION_ACTUAL})",
+        command=lambda: verificar_actualizaciones(mostrar_si_al_dia=True),
+        fg_color="transparent",
+        hover_color="#1F242D",
+        text_color="#9CA3AF",
+        height=26,
+        corner_radius=8,
+        font=ctk.CTkFont(size=11),
+    ).pack(fill="x", padx=24, pady=(0, 6))
+
+    ctk.CTkButton(
+        ventana_ajustes,
+        text="Cerrar app por completo",
+        command=salir_por_completo,
+        fg_color="transparent",
+        hover_color="#374151",
+        text_color="#F87171",
+        height=26,
+        corner_radius=8,
+        font=ctk.CTkFont(size=11),
     ).pack(fill="x", padx=24)
 
 
 def agregar_con_enter(event=None):
     texto = entrada_tarea.get().strip()
-    etiqueta_sel = selector_dia.get()
-    fecha_iso = opciones_menu.get(etiqueta_sel, hoy_dt.strftime("%Y-%m-%d"))
-
     if texto:
         agregar_tarea(
             texto,
-            fecha_iso,
+            fecha_seleccionada_nueva["iso"],
             hora=recordatorio_actual["hora"],
             anticipacion=recordatorio_actual["anticipacion"],
         )
@@ -913,19 +1937,336 @@ def agregar_con_enter(event=None):
         recordatorio_actual["hora"] = ""
         recordatorio_actual["anticipacion"] = 0
         actualizar_boton_hora()
+        fecha_seleccionada_nueva["iso"] = datetime.now().date().strftime("%Y-%m-%d")
+        actualizar_boton_calendario_principal()
         actualizar_lista()
 
 
+def renderizar_tarjeta_dia(parent, datos_dia, es_hoy=False):
+    """Renderiza la tarjeta de un día con su encabezado interactivo y píldoras."""
+    clave_orden = datos_dia["orden"]
+    etiqueta = datos_dia["etiqueta"]
+    tareas_grupo = datos_dia["tareas"]
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    hoy_iso = datetime.now().date().strftime("%Y-%m-%d")
+
+    def clave_orden_tarea(tk):
+        esta_lista = tk.get("completada", False)
+        prio_map = {"rojo": 0, "amarillo": 1, "verde": 2}
+        prio_val = prio_map.get(tk.get("prioridad", "verde"), 2)
+        tiene_hora = 0 if tk.get("hora") else 1
+        h = tk.get("hora", "")
+        return (1 if esta_lista else 0, prio_val, tiene_hora, h)
+
+    tareas_grupo.sort(key=clave_orden_tarea)
+
+    es_atrasada = clave_orden < hoy_iso
+    abierto = True if filtro_busqueda.strip() else secciones_abiertas.get(clave_orden, es_hoy)
+    incompletas = len([tk for tk in tareas_grupo if not tk.get("completada")])
+
+    if es_atrasada:
+        if incompletas == 0:
+            color_badge = t.get("badge_ok", "#34D399")
+            texto_badge = "✓"
+            color_titulo = t["text_muted"]
+            etiqueta_mostrar = etiqueta.replace("⚠️ ", "").replace(" (Atrasado)", "")
+        else:
+            color_badge = t.get("badge_alert", "#F87171")
+            texto_badge = str(incompletas)
+            color_titulo = t.get("badge_alert", "#F87171")
+            etiqueta_mostrar = etiqueta
+    else:
+        color_badge = (
+            t.get("badge_ok", "#34D399")
+            if incompletas == 0
+            else t.get("badge_alert", "#F87171")
+        )
+        texto_badge = (
+            str(incompletas) if incompletas > 0 else ("✓" if tareas_grupo else "0")
+        )
+        color_titulo = t["text_main"] if es_hoy else t["text_muted"]
+        etiqueta_mostrar = etiqueta
+
+    seccion_dia = ctk.CTkFrame(parent, fg_color="transparent")
+    seccion_dia.pack(fill="x", pady=(6, 2), padx=4)
+    widgets_dias[clave_orden] = seccion_dia
+
+    # HEADER DEL DÍA: NOMBRE + LÍNEA + BADGE
+    header_row = ctk.CTkFrame(seccion_dia, fg_color="transparent", cursor="hand2")
+    header_row.pack(fill="x", padx=4, pady=(2, 4))
+
+    simbolo_flecha = "▼" if abierto else "▶"
+    lbl_flecha = ctk.CTkLabel(
+        header_row,
+        text=simbolo_flecha,
+        font=ctk.CTkFont(size=10, weight="bold"),
+        text_color=color_titulo,
+    )
+    lbl_flecha.pack(side="left", padx=(2, 6))
+
+    lbl_seccion = ctk.CTkLabel(
+        header_row,
+        text=etiqueta_mostrar,
+        font=ctk.CTkFont(
+            family="Segoe UI Variable Display",
+            size=12,
+            weight="bold",
+        ),
+        text_color=color_titulo,
+    )
+    lbl_seccion.pack(side="left", padx=(0, 6))
+
+    linea_divisoria = ctk.CTkFrame(
+        header_row,
+        height=1,
+        fg_color=t.get("border_card", "#2C2C2C"),
+    )
+    linea_divisoria.pack(side="left", fill="x", expand=True, padx=(4, 8))
+
+    lbl_badge = ctk.CTkLabel(
+        header_row,
+        text=texto_badge,
+        font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+        text_color=color_badge,
+    )
+    lbl_badge.pack(side="right", padx=(2, 4))
+
+    for widget_header in [
+        header_row,
+        lbl_flecha,
+        lbl_seccion,
+        linea_divisoria,
+        lbl_badge,
+    ]:
+        widget_header.bind(
+            "<Button-1>",
+            lambda event, cl=clave_orden: alternar_seccion(cl),
+        )
+
+    # TARJETA CON LAS PÍLDORAS (Marco normal para que nunca se corte)
+    if abierto:
+        card_dia = ctk.CTkFrame(
+            seccion_dia,
+            fg_color=t["bg_card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=t["border_card"],
+        )
+        card_dia.pack(fill="x", padx=4, pady=(2, 6))
+
+        if es_hoy:
+            listas_h = len([tk for tk in tareas_grupo if tk.get("completada")])
+            tot_h = len(tareas_grupo)
+            pct = listas_h / tot_h if tot_h > 0 else 0
+
+            if tot_h > 0:
+                frame_progreso = ctk.CTkFrame(
+                    card_dia,
+                    fg_color=t["bg_app"],
+                    corner_radius=8,
+                )
+                frame_progreso.pack(fill="x", padx=8, pady=(8, 4))
+
+                row_prog = ctk.CTkFrame(frame_progreso, fg_color="transparent")
+                row_prog.pack(fill="x", padx=10, pady=(6, 2))
+
+                ctk.CTkLabel(
+                    row_prog,
+                    text=f"🎯 Progreso de hoy: {listas_h}/{tot_h} ({int(pct * 100)}%)",
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    text_color=t["text_muted"],
+                ).pack(side="left")
+
+                color_barra = "#10B981" if tema_actual != "Hello Kitty" else "#EC4899"
+                prog_bar = ctk.CTkProgressBar(
+                    frame_progreso,
+                    height=6,
+                    corner_radius=3,
+                    progress_color=color_barra,
+                    fg_color=t["bg_card"],
+                )
+                prog_bar.set(pct)
+                prog_bar.pack(fill="x", padx=10, pady=(2, 6))
+
+        if not tareas_grupo:
+            if es_hoy:
+                ctk.CTkLabel(
+                    card_dia,
+                    text="No tienes tareas pendientes para hoy ✨\nEscribe arriba y presiona Enter para agregar una.",
+                    font=ctk.CTkFont(family="Segoe UI Variable Text", size=11),
+                    text_color=t["text_muted"],
+                    justify="center",
+                ).pack(pady=12)
+        else:
+            for task in tareas_grupo:
+                tid = task.get("id")
+                esta_lista = task.get("completada", False)
+
+                prio = task.get("prioridad", "verde")
+                color_tag = None
+                if prio == "rojo":
+                    color_tag = "#EF4444"
+                elif prio == "amarillo":
+                    color_tag = "#F59E0B"
+
+                borde_capsula = (
+                    t["border_input"]
+                    if not esta_lista
+                    else ("#222731" if tema_actual != "Hello Kitty" else "#F9A8D4")
+                )
+                if color_tag and not esta_lista:
+                    borde_capsula = "#7F1D1D" if prio == "rojo" else "#78350F"
+
+                capsula = ctk.CTkFrame(
+                    card_dia,
+                    fg_color=(
+                        t["bg_input"]
+                        if not esta_lista
+                        else ("#161920" if tema_actual != "Hello Kitty" else "#FCE7F3")
+                    ),
+                    corner_radius=8,
+                    border_width=1,
+                    border_color=borde_capsula,
+                    cursor="hand2",
+                )
+                capsula.pack(fill="x", pady=3, padx=6)
+
+                # Clic izquierdo normal: Modificar tarea
+                capsula.bind(
+                    "<Button-1>",
+                    lambda event, tk=task: abrir_modal_edicion(tk),
+                )
+                # Clic derecho: Popup con Prioridad y Eliminar
+                capsula.bind(
+                    "<Button-3>",
+                    lambda event, tk=task: mostrar_popup_eliminar(event, tk),
+                )
+
+                if color_tag and not esta_lista:
+                    tag_bar = ctk.CTkFrame(
+                        capsula,
+                        width=3,
+                        height=18,
+                        fg_color=color_tag,
+                        corner_radius=2,
+                    )
+                    tag_bar.pack(side="left", padx=(6, 0), pady=6)
+                    tag_bar.bind(
+                        "<Button-1>",
+                        lambda event, tk=task: abrir_modal_edicion(tk),
+                    )
+                    tag_bar.bind(
+                        "<Button-3>",
+                        lambda event, tk=task: mostrar_popup_eliminar(event, tk),
+                    )
+
+                casilla = ctk.CTkCheckBox(
+                    capsula,
+                    text="",
+                    width=20,
+                    checkbox_width=18,
+                    checkbox_height=18,
+                    corner_radius=9,
+                    border_width=1,
+                    border_color="#374151",
+                    fg_color=("#10B981" if tema_actual != "Hello Kitty" else "#EC4899"),
+                    hover_color=(
+                        "#059669" if tema_actual != "Hello Kitty" else "#DB2777"
+                    ),
+                    command=lambda tid_val=tid: toggle_click(tid_val),
+                )
+                if esta_lista:
+                    casilla.select()
+                else:
+                    casilla.deselect()
+
+                casilla.pack(side="left", padx=(8, 4), pady=7)
+                casilla.bind(
+                    "<Button-3>",
+                    lambda event, tk=task: mostrar_popup_eliminar(event, tk),
+                )
+
+                if task.get("hora"):
+                    lbl_hora_item = ctk.CTkLabel(
+                        capsula,
+                        text=f"⏰ {task['hora']}",
+                        font=ctk.CTkFont(
+                            size=11,
+                            weight="normal" if esta_lista else "bold",
+                            overstrike=esta_lista,
+                        ),
+                        text_color=(
+                            "#6B7280"
+                            if esta_lista
+                            else (
+                                "#10B981" if tema_actual != "Hello Kitty" else "#E11D48"
+                            )
+                        ),
+                        cursor="hand2",
+                    )
+                    lbl_hora_item.pack(side="right", padx=(2, 12), pady=6)
+                    lbl_hora_item.bind(
+                        "<Button-1>",
+                        lambda event, tk=task: abrir_modal_edicion(tk),
+                    )
+                    lbl_hora_item.bind(
+                        "<Button-3>",
+                        lambda event, tk=task: mostrar_popup_eliminar(event, tk),
+                    )
+
+                texto_tarea = ctk.CTkLabel(
+                    capsula,
+                    text=task.get("nombre", ""),
+                    anchor="w",
+                    justify="left",
+                    wraplength=220,
+                    text_color="#6B7280" if esta_lista else t["text_main"],
+                    cursor="hand2",
+                    font=ctk.CTkFont(
+                        family="Segoe UI Variable Text",
+                        size=12,
+                        weight="normal" if esta_lista else "bold",
+                        slant="italic" if esta_lista else "roman",
+                        overstrike=esta_lista,
+                    ),
+                )
+                texto_tarea.pack(
+                    side="left",
+                    fill="x",
+                    expand=True,
+                    padx=4,
+                    pady=7,
+                )
+                texto_tarea.bind(
+                    "<Button-1>",
+                    lambda event, tk=task: abrir_modal_edicion(tk),
+                )
+                texto_tarea.bind(
+                    "<Button-3>",
+                    lambda event, tk=task: mostrar_popup_eliminar(event, tk),
+                )
+
+
 def actualizar_lista():
+    if modo_widget:
+        actualizar_contenido_widget()
+        return
+
     for elemento in macro_tareas.winfo_children():
         elemento.destroy()
 
+    widgets_dias.clear()
     t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
 
-    pendientes = len([t_item for t_item in tareas if not t_item.get("completada")])
-    color_contador = "#199423" if pendientes == 0 else t.get("badge_alert", "#F87171")
+    pendientes_totales = len(
+        [t_item for t_item in tareas if not t_item.get("completada")]
+    )
+
+    color_contador = (
+        "#199423" if pendientes_totales == 0 else t.get("badge_alert", "#F87171")
+    )
     lbl_contador.configure(
-        text=f"{pendientes} Pendiente{'s' if pendientes != 1 else ''}",
+        text=f"{pendientes_totales} Pendiente{'s' if pendientes_totales != 1 else ''}",
         text_color=color_contador,
     )
 
@@ -969,162 +2310,451 @@ def actualizar_lista():
     else:
         lbl_kitty_header.pack_forget()
 
-    grupos = {}
+    hoy_dt = datetime.now().date()
+    hoy_iso = hoy_dt.strftime("%Y-%m-%d")
+    mes_actual_iso = hoy_dt.strftime("%Y-%m")
+
+    # 1. Asegurar que "Hoy" siempre exista en su grupo
+    etiqueta_hoy, _ = obtener_etiqueta_dinamica(hoy_iso)
+    grupos_por_dia = {
+        hoy_iso: {
+            "etiqueta": etiqueta_hoy,
+            "orden": hoy_iso,
+            "tareas": [],
+        }
+    }
+
+    texto_filtro = filtro_busqueda.strip().lower()
+
+    # Agrupar TODAS las tareas (o las que coincidan con la búsqueda)
     for item in tareas:
-        etiqueta, orden_clave = obtener_etiqueta_dinamica(item.get("fecha", ""))
-        if etiqueta not in grupos:
-            grupos[etiqueta] = {"orden": orden_clave, "tareas": []}
-        grupos[etiqueta]["tareas"].append(item)
+        if texto_filtro and texto_filtro not in item.get("nombre", "").lower():
+            continue
+        f_item = item.get("fecha", "")
+        etiqueta, orden_clave = obtener_etiqueta_dinamica(f_item)
+        if orden_clave not in grupos_por_dia:
+            grupos_por_dia[orden_clave] = {
+                "etiqueta": etiqueta,
+                "orden": orden_clave,
+                "tareas": [],
+            }
+        grupos_por_dia[orden_clave]["tareas"].append(item)
 
-    grupos_ordenados = sorted(grupos.items(), key=lambda x: x[1]["orden"])
-
-    for etiqueta, datos in grupos_ordenados:
-        tareas_grupo = datos["tareas"]
-        abierto = secciones_abiertas.get(etiqueta, False)
-        incompletas = len([it for it in tareas_grupo if not it.get("completada")])
-        color_badge = (
-            t.get("badge_ok", "#34D399")
-            if incompletas == 0
-            else t.get("badge_alert", "#F87171")
-        )
-
-        card_dia = ctk.CTkFrame(
+    if texto_filtro and not any(d["tareas"] for d in grupos_por_dia.values()):
+        lbl_vacio_b = ctk.CTkLabel(
             macro_tareas,
-            fg_color=t["bg_card"],
-            corner_radius=10,
-            border_width=2,
-            border_color=t["border_card"],
-        )
-        card_dia.pack(fill="x", pady=4, padx=4)
-
-        header_row = ctk.CTkFrame(card_dia, fg_color="transparent", height=32)
-        header_row.pack(fill="x", padx=10, pady=6)
-
-        icono_tema = t.get("icono", "•" if abierto else "◦")
-        simbolo = f"{icono_tema} " if abierto else "◦"
-        lbl_seccion = ctk.CTkLabel(
-            header_row,
-            text=f"{simbolo}  {etiqueta}",
-            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            text=f"🔍 Sin resultados para:\n\"{filtro_busqueda}\"",
+            fg_color="transparent",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=13),
             text_color=t["text_muted"],
-            cursor="hand2",
+            justify="center",
         )
-        lbl_seccion.pack(side="left")
-        lbl_seccion.bind(
-            "<Button-1>", lambda event, e=etiqueta, c=card_dia: alternar_seccion(e, c)
-        )
-        header_row.bind(
-            "<Button-1>", lambda event, e=etiqueta, c=card_dia: alternar_seccion(e, c)
+        lbl_vacio_b.pack(pady=60)
+        return
+
+    # 2. Agrupar días por mes (TODOS los días quedan dentro de su mes correspondiente)
+    meses = {}
+
+    for clave_dia, datos_dia in grupos_por_dia.items():
+        if clave_dia != hoy_iso and not datos_dia["tareas"]:
+            continue
+
+        try:
+            dt_dia = datetime.strptime(clave_dia, "%Y-%m-%d").date()
+            clave_mes = dt_dia.strftime("%Y-%m")
+            nom_m = MESES_ESPANOL[dt_dia.month].upper()
+            nombre_mes = f"{nom_m} {dt_dia.year}"
+        except Exception:
+            clave_mes = "9999-99"
+            nombre_mes = "OTRAS FECHAS"
+
+        if clave_mes not in meses:
+            meses[clave_mes] = {
+                "clave": clave_mes,
+                "nombre": nombre_mes,
+                "dias": [],
+            }
+        meses[clave_mes]["dias"].append(datos_dia)
+
+    # 3. Ordenar meses de MAYOR a MENOR (Noviembre arriba, luego Octubre, etc.)
+    for clave_mes, datos_mes in sorted(meses.items(), key=lambda x: x[0], reverse=True):
+        if not datos_mes["dias"]:
+            continue
+
+        # Ordenar los días dentro del mes:
+        # - Hoy siempre hasta arriba dentro de su mes
+        # - Los demás días de mayor a menor (31, 30, 28, etc.)
+        def criterio_dia(d):
+            c = d["orden"]
+            if c == hoy_iso:
+                return (0, 0)
+            try:
+                val = -int(c.replace("-", ""))
+            except Exception:
+                val = 0
+            return (1, val)
+
+        datos_mes["dias"].sort(key=criterio_dia)
+
+        total_pendientes_mes = sum(
+            len([tk for tk in d["tareas"] if not tk.get("completada")])
+            for d in datos_mes["dias"]
         )
 
-        lbl_badge = ctk.CTkLabel(
-            header_row,
-            text=str(incompletas),
+        es_mes_actual = clave_mes == mes_actual_iso
+        mes_abierto = True if texto_filtro else meses_abiertos.get(clave_mes, es_mes_actual)
+
+        contenedor_mes = ctk.CTkFrame(macro_tareas, fg_color="transparent")
+        contenedor_mes.pack(fill="x", pady=(10, 4), padx=2)
+        widgets_dias[f"mes_{clave_mes}"] = contenedor_mes
+
+        banner_mes = ctk.CTkFrame(
+            contenedor_mes, fg_color="transparent", cursor="hand2"
+        )
+        banner_mes.pack(fill="x", padx=4, pady=(4, 6))
+
+        flecha_mes = "▼" if mes_abierto else "▶"
+        lbl_flecha_mes = ctk.CTkLabel(
+            banner_mes,
+            text=flecha_mes,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=t["text_main"] if es_mes_actual else t["text_muted"],
+        )
+        lbl_flecha_mes.pack(side="left", padx=(2, 6))
+
+        lbl_nombre_mes = ctk.CTkLabel(
+            banner_mes,
+            text=f"🗓️  {datos_mes['nombre']}",
+            font=ctk.CTkFont(
+                family="Segoe UI Variable Display", size=15, weight="bold"
+            ),
+            text_color=t["text_main"] if es_mes_actual else t["text_muted"],
+        )
+        lbl_nombre_mes.pack(side="left", padx=(0, 8))
+
+        linea_mes = ctk.CTkFrame(
+            banner_mes,
+            height=2,
+            fg_color=t.get("border_card", "#2C2C2C"),
+        )
+        linea_mes.pack(side="left", fill="x", expand=True, padx=(4, 8))
+
+        texto_badge_mes = f"{total_pendientes_mes} pendiente{'s' if total_pendientes_mes != 1 else ''}"
+        color_badge_mes = (
+            t["badge_ok"] if total_pendientes_mes == 0 else t["badge_alert"]
+        )
+        lbl_badge_mes = ctk.CTkLabel(
+            banner_mes,
+            text=texto_badge_mes,
             font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
-            text_color=color_badge,
+            text_color=color_badge_mes,
         )
-        lbl_badge.pack(side="right")
+        lbl_badge_mes.pack(side="right", padx=(2, 4))
 
-        if abierto:
-            for task in tareas_grupo:
-                esta_lista = task["completada"]
+        for w_m in [
+            banner_mes,
+            lbl_flecha_mes,
+            lbl_nombre_mes,
+            linea_mes,
+            lbl_badge_mes,
+        ]:
+            w_m.bind("<Button-1>", lambda event, cm=clave_mes: alternar_mes(cm))
 
-                fila = ctk.CTkFrame(card_dia, fg_color="transparent")
-                fila.pack(fill="x", pady=2, padx=6)
-
-                casilla = ctk.CTkCheckBox(
-                    fila,
-                    text="",
-                    width=20,
-                    checkbox_width=18,
-                    checkbox_height=18,
-                    corner_radius=9,
-                    border_width=1,
-                    border_color="#374151" if not esta_lista else "#10B981",
-                    fg_color="#10B981" if tema_actual != "Hello Kitty" else "#EC4899",
-                    hover_color=(
-                        "#059669" if tema_actual != "Hello Kitty" else "#DB2777"
-                    ),
-                    command=lambda n=task["nombre"]: toggle_click(n),
+        # SI EL MES ESTÁ ABIERTO, SE MUESTRAN SUS DÍAS DE MAYOR A MENOR (CON HOY HASTA ARRIBA)
+        if mes_abierto:
+            for datos_dia in datos_mes["dias"]:
+                renderizar_tarjeta_dia(
+                    contenedor_mes,
+                    datos_dia,
+                    es_hoy=(datos_dia["orden"] == hoy_iso),
                 )
-                if esta_lista:
-                    casilla.select()
-                casilla.pack(side="left", padx=(4, 6), pady=4)
-
-                btn_del = ctk.CTkButton(
-                    fila,
-                    text="✕",
-                    width=22,
-                    height=22,
-                    corner_radius=5,
-                    fg_color="transparent",
-                    text_color="#6B7280" if tema_actual != "Hello Kitty" else "#DB2777",
-                    hover_color=(
-                        "#374151" if tema_actual != "Hello Kitty" else "#FCE7F3"
-                    ),
-                    font=ctk.CTkFont(size=11, weight="bold"),
-                    command=lambda n=task["nombre"]: borrar_click(n),
-                )
-                btn_del.pack(side="right", padx=(2, 4))
-
-                if task.get("hora"):
-                    btn_hora_item = ctk.CTkButton(
-                        fila,
-                        text=f"⏰ {task['hora']}",
-                        width=56,
-                        height=20,
-                        corner_radius=5,
-                        fg_color="transparent",
-                        hover_color=t["border_card"],
-                        text_color=t["text_muted"],
-                        font=ctk.CTkFont(size=10, weight="bold"),
-                        command=lambda tk=task: abrir_selector_hora(tk),
-                    )
-                    btn_hora_item.pack(side="right", padx=(2, 4))
-                else:
-                    btn_hora_item = ctk.CTkButton(
-                        fila,
-                        text="⏰",
-                        width=22,
-                        height=20,
-                        corner_radius=5,
-                        fg_color="transparent",
-                        hover_color=t["border_card"],
-                        text_color=t.get("placeholder", "#4B5563"),
-                        font=ctk.CTkFont(size=11),
-                        command=lambda tk=task: abrir_selector_hora(tk),
-                    )
-                    btn_hora_item.pack(side="right", padx=(2, 4))
-
-                texto_color = "#4B5563" if esta_lista else t["text_main"]
-                texto_tarea = ctk.CTkLabel(
-                    fila,
-                    text=task["nombre"],
-                    anchor="w",
-                    justify="left",
-                    wraplength=190,
-                    text_color=texto_color,
-                    font=ctk.CTkFont(
-                        family="Segoe UI Variable Text",
-                        size=13,
-                        weight="bold" if not esta_lista else "normal",
-                        slant="italic" if esta_lista else "roman",
-                    ),
-                )
-                texto_tarea.pack(side="left", fill="x", expand=True, pady=4)
 
 
 # ==========================================
-# BLOQUE 4: INTERFAZ PRINCIPAL
+# BLOQUE 4: SEGUNDO PLANO Y BANDEJA (TRAY)
+# ==========================================
+def crear_icono_bandeja():
+    ruta_img = obtener_ruta_imagen_kitty()
+    if ruta_img and os.path.exists(ruta_img):
+        try:
+            img = Image.open(ruta_img).convert("RGBA")
+            img = img.resize((64, 64), Image.Resampling.LANCZOS)
+            return img
+        except Exception:
+            pass
+
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((4, 4, 60, 60), fill="#10B981")
+    d.line([(18, 33), (28, 44), (46, 20)], fill="#FFFFFF", width=6)
+    return img
+
+
+def mostrar_ventana(icon=None, item=None):
+    app.after(0, _restaurar_ventana_principal)
+
+
+def _restaurar_ventana_principal():
+    app.deiconify()
+    app.state("normal")
+    app.lift()
+    app.focus_force()
+
+
+def minimizar_a_bandeja():
+    global _aviso_bandeja_mostrado
+    app.withdraw()
+    if not _aviso_bandeja_mostrado and HAY_PLYER:
+        _aviso_bandeja_mostrado = True
+        try:
+            notification.notify(
+                title="To-Do List activa en segundo plano",
+                message="Seguirás recibiendo tus recordatorios aquí junto al reloj.",
+                app_name="To-Do List",
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+
+def salir_por_completo(icon=None, item=None):
+    global tray_icon
+    if tray_icon:
+        try:
+            tray_icon.stop()
+        except Exception:
+            pass
+    app.after(0, app.destroy)
+
+
+def inicializar_tray():
+    global tray_icon
+    if not HAY_PYSTRAY:
+        return
+    try:
+        icono_img = crear_icono_bandeja()
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir To-Do List", mostrar_ventana, default=True),
+            pystray.MenuItem("Salir", salir_por_completo),
+        )
+        tray_icon = pystray.Icon(
+            "KokeToDo",
+            icono_img,
+            f"{nombre_usuario}'s To-Do List",
+            menu,
+        )
+        tray_icon.run_detached()
+    except Exception:
+        pass
+
+
+# ==========================================
+# BLOQUE 5: INTERFAZ PRINCIPAL
 # ==========================================
 ctk.set_appearance_mode("dark")
 
 app = ctk.CTk()
-app.geometry("400x400+1480+300")
+app.geometry("420x620+1460+180")
 app.attributes("-topmost", True)
+
+app.protocol("WM_DELETE_WINDOW", minimizar_a_bandeja)
 
 nombre_usuario = cargar_configuracion()
 app.title(f"{nombre_usuario}'s To-Do List")
+
+
+def alternar_modo_widget(e=None):
+    """Alterna entre la ventana completa y el mini-widget flotante minimalista."""
+    global modo_widget, geometria_previa
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    if not modo_widget:
+        modo_widget = True
+        geometria_previa = app.geometry()
+        # Ocultar elementos de vista completa
+        if busqueda_activa:
+            marco_busqueda.pack_forget()
+        header.pack_forget()
+        marco_input.pack_forget()
+        macro_tareas.pack_forget()
+        footer.pack_forget()
+
+        app.attributes("-topmost", True)
+        try:
+            partes = geometria_previa.split("+")
+            if len(partes) >= 3:
+                pos_x, pos_y = partes[1], partes[2]
+                app.geometry(f"360x76+{pos_x}+{pos_y}")
+            else:
+                app.geometry("360x76")
+        except Exception:
+            app.geometry("360x76")
+
+        lbl_widget_titulo.configure(
+            text=f"📌 ¡Hola, {nombre_usuario}!", text_color=t["text_main"]
+        )
+        marco_widget.pack(fill="both", expand=True, padx=8, pady=6)
+        actualizar_contenido_widget()
+    else:
+        modo_widget = False
+        marco_widget.pack_forget()
+        try:
+            app.geometry(geometria_previa)
+        except Exception:
+            app.geometry("420x620")
+
+        # Restaurar vista completa
+        header.pack(fill="x", padx=20, pady=(18, 4))
+        if busqueda_activa:
+            marco_busqueda.pack(before=marco_input, fill="x", padx=20, pady=(0, 6))
+        marco_input.pack(pady=10, padx=20, fill="x")
+        macro_tareas.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+        footer.pack(side="bottom", fill="x", padx=16, pady=(0, 10))
+        actualizar_lista()
+
+
+def actualizar_contenido_widget():
+    """Actualiza la tarea prioritaria mostrada en el widget flotante."""
+    if not modo_widget or "marco_widget_contenido" not in globals():
+        return
+    for w in marco_widget_contenido.winfo_children():
+        w.destroy()
+
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    hoy_iso = datetime.now().date().strftime("%Y-%m-%d")
+    prio_map = {"rojo": 0, "amarillo": 1, "verde": 2}
+
+    pendientes_hoy = [
+        tk for tk in tareas if tk.get("fecha") == hoy_iso and not tk.get("completada")
+    ]
+    tarea_top = None
+    if pendientes_hoy:
+        pendientes_hoy.sort(
+            key=lambda tk: (
+                prio_map.get(tk.get("prioridad", "verde"), 2),
+                0 if tk.get("hora") else 1,
+                tk.get("hora", ""),
+            )
+        )
+        tarea_top = pendientes_hoy[0]
+    else:
+        otras_pendientes = [tk for tk in tareas if not tk.get("completada")]
+        if otras_pendientes:
+            otras_pendientes.sort(
+                key=lambda tk: (
+                    prio_map.get(tk.get("prioridad", "verde"), 2),
+                    tk.get("fecha", ""),
+                    tk.get("hora", ""),
+                )
+            )
+            tarea_top = otras_pendientes[0]
+
+    if tarea_top:
+        prio = tarea_top.get("prioridad", "verde")
+        color_prio = (
+            "#EF4444"
+            if prio == "rojo"
+            else ("#F59E0B" if prio == "amarillo" else "#10B981")
+        )
+
+        fila_tk = ctk.CTkFrame(
+            marco_widget_contenido,
+            fg_color=t["bg_input"],
+            corner_radius=8,
+            border_width=1,
+            border_color=(
+                "#7F1D1D"
+                if prio == "rojo"
+                else ("#78350F" if prio == "amarillo" else t["border_input"])
+            ),
+            height=34,
+        )
+        fila_tk.pack(fill="x", padx=4, pady=2)
+
+        tag_b = ctk.CTkFrame(
+            fila_tk, width=3, height=18, fg_color=color_prio, corner_radius=2
+        )
+        tag_b.pack(side="left", padx=(4, 0), pady=4)
+
+        def completar_desde_widget(tid=tarea_top["id"]):
+            toggle_click(tid)
+            actualizar_contenido_widget()
+
+        chk = ctk.CTkCheckBox(
+            fila_tk,
+            text="",
+            width=18,
+            checkbox_width=16,
+            checkbox_height=16,
+            corner_radius=8,
+            border_width=1,
+            border_color="#374151",
+            fg_color="#10B981" if tema_actual != "Hello Kitty" else "#EC4899",
+            hover_color="#059669" if tema_actual != "Hello Kitty" else "#DB2777",
+            command=completar_desde_widget,
+        )
+        chk.pack(side="left", padx=(6, 4), pady=5)
+
+        txt_nombre = tarea_top.get("nombre", "")
+        if len(txt_nombre) > 26:
+            txt_nombre = txt_nombre[:24] + "…"
+        lbl_nom = ctk.CTkLabel(
+            fila_tk,
+            text=txt_nombre,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            text_color=t["text_main"],
+            anchor="w",
+            cursor="hand2",
+        )
+        lbl_nom.pack(side="left", fill="x", expand=True, padx=(2, 4))
+        lbl_nom.bind("<Button-1>", lambda e, tk=tarea_top: abrir_modal_edicion(tk))
+
+        if tarea_top.get("hora"):
+            lbl_h = ctk.CTkLabel(
+                fila_tk,
+                text=f"⏰ {tarea_top['hora']}",
+                font=ctk.CTkFont(family="Segoe UI Variable Text", size=10),
+                text_color=t.get("accent", "#60A5FA"),
+            )
+            lbl_h.pack(side="right", padx=(2, 6))
+    else:
+        fila_vacia = ctk.CTkFrame(marco_widget_contenido, fg_color="transparent")
+        fila_vacia.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            fila_vacia,
+            text="✨ ¡Todo listo por hoy!",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            text_color=t.get("badge_ok", "#34D399"),
+        ).pack(side="left", padx=8)
+
+
+def alternar_barra_busqueda(e=None):
+    """Muestra u oculta la barra de búsqueda minimalista (o con Ctrl+F)."""
+    global busqueda_activa, filtro_busqueda
+    if modo_widget:
+        alternar_modo_widget()
+
+    t = TEMAS.get(tema_actual, TEMAS["Obsidian"])
+    if not busqueda_activa:
+        busqueda_activa = True
+        marco_busqueda.pack(before=marco_input, fill="x", padx=20, pady=(0, 6))
+        entrada_busqueda.delete(0, "end")
+        entrada_busqueda.focus()
+        btn_buscar.configure(text_color=t.get("accent", "#60A5FA"))
+    else:
+        busqueda_activa = False
+        filtro_busqueda = ""
+        entrada_busqueda.delete(0, "end")
+        marco_busqueda.pack_forget()
+        btn_buscar.configure(text_color=t["text_muted"])
+        actualizar_lista()
+        app.focus()
+
+
+def al_escribir_busqueda(event=None):
+    global filtro_busqueda
+    filtro_busqueda = entrada_busqueda.get()
+    actualizar_lista()
+
 
 header = ctk.CTkFrame(app, fg_color="transparent")
 header.pack(fill="x", padx=20, pady=(18, 4))
@@ -1134,9 +2764,108 @@ lbl_titulo = ctk.CTkLabel(
     text=f"¡Hola, {nombre_usuario}!",
     font=ctk.CTkFont(family="Segoe UI Variable Display", size=18, weight="bold"),
     text_color="#F9FAFB",
+    cursor="hand2",
 )
 lbl_titulo.pack(side="left")
+lbl_titulo.bind("<Button-1>", alternar_modo_widget)
+
+btn_buscar = ctk.CTkButton(
+    header,
+    text="🔍",
+    width=26,
+    height=26,
+    corner_radius=6,
+    fg_color="transparent",
+    text_color="#6B7280",
+    hover_color="#1F232B",
+    font=ctk.CTkFont(size=12),
+    command=alternar_barra_busqueda,
+)
+btn_buscar.pack(side="right", padx=(4, 0))
+
 lbl_kitty_header = ctk.CTkLabel(header, text="", fg_color="transparent")
+
+# Barra de Búsqueda minimalista (oculta inicialmente, se abre con 🔍 o Ctrl+F)
+marco_busqueda = ctk.CTkFrame(
+    app,
+    fg_color="#13161C",
+    corner_radius=10,
+    border_width=1,
+    border_color="#1F242D",
+    height=32,
+)
+
+lbl_icono_b = ctk.CTkLabel(
+    marco_busqueda,
+    text="🔍",
+    font=ctk.CTkFont(size=11),
+    text_color="#6B7280",
+    width=20,
+)
+lbl_icono_b.pack(side="left", padx=(8, 2))
+
+entrada_busqueda = ctk.CTkEntry(
+    marco_busqueda,
+    placeholder_text="Buscar tarea... (Esc para salir)",
+    placeholder_text_color="#4B5563",
+    fg_color="transparent",
+    border_width=0,
+    font=ctk.CTkFont(family="Segoe UI Variable Text", size=11),
+    height=28,
+)
+entrada_busqueda.pack(side="left", fill="x", expand=True, padx=2)
+entrada_busqueda.bind("<KeyRelease>", al_escribir_busqueda)
+entrada_busqueda.bind("<Escape>", lambda e: alternar_barra_busqueda())
+
+btn_cerrar_busqueda = ctk.CTkButton(
+    marco_busqueda,
+    text="✕",
+    width=22,
+    height=22,
+    corner_radius=6,
+    fg_color="transparent",
+    hover_color="#222732",
+    text_color="#6B7280",
+    font=ctk.CTkFont(size=11),
+    command=alternar_barra_busqueda,
+)
+btn_cerrar_busqueda.pack(side="right", padx=(2, 6))
+
+app.bind("<Control-f>", lambda e: alternar_barra_busqueda())
+app.bind("<Control-F>", lambda e: alternar_barra_busqueda())
+
+# Marco Widget flotante minimalista (se activa al tocar el saludo)
+marco_widget = ctk.CTkFrame(app, fg_color="transparent")
+
+fila_widget_sup = ctk.CTkFrame(marco_widget, fg_color="transparent", height=18)
+fila_widget_sup.pack(fill="x", padx=2, pady=(0, 2))
+
+lbl_widget_titulo = ctk.CTkLabel(
+    fila_widget_sup,
+    text=f"📌 ¡Hola, {nombre_usuario}!",
+    font=ctk.CTkFont(family="Segoe UI Variable Display", size=11, weight="bold"),
+    text_color="#F9FAFB",
+    cursor="hand2",
+)
+lbl_widget_titulo.pack(side="left")
+lbl_widget_titulo.bind("<Button-1>", alternar_modo_widget)
+
+btn_widget_expandir = ctk.CTkButton(
+    fila_widget_sup,
+    text="⛶",
+    width=20,
+    height=18,
+    corner_radius=4,
+    fg_color="transparent",
+    hover_color="#222732",
+    text_color="#9CA3AF",
+    font=ctk.CTkFont(size=11),
+    command=alternar_modo_widget,
+)
+btn_widget_expandir.pack(side="right")
+
+marco_widget_contenido = ctk.CTkFrame(marco_widget, fg_color="transparent")
+marco_widget_contenido.pack(fill="x", expand=True)
 
 marco_input = ctk.CTkFrame(
     app,
@@ -1149,7 +2878,7 @@ marco_input.pack(pady=10, padx=20, fill="x")
 
 entrada_tarea = ctk.CTkEntry(
     marco_input,
-    placeholder_text="Escribe aqui...",
+    placeholder_text="Escribe aquí...",
     placeholder_text_color="#4B5563",
     fg_color="transparent",
     border_width=0,
@@ -1169,34 +2898,34 @@ btn_hora = ctk.CTkButton(
     text_color="#9CA3AF",
     hover_color="#1F232B",
     font=ctk.CTkFont(size=12),
-    command=abrir_selector_hora,
+    command=lambda: abrir_modal_edicion(None),
 )
 btn_hora.pack(side="right", padx=(0, 4), pady=3)
 
-selector_dia = ctk.CTkOptionMenu(
+# Botón interactivo de calendario
+btn_calendario = ctk.CTkButton(
     marco_input,
-    values=lista_dias_etiquetas,
+    text=obtener_texto_boton_fecha(fecha_seleccionada_nueva["iso"]),
     width=110,
     height=26,
     corner_radius=7,
     fg_color="#1D222A",
-    button_color="#242B35",
-    button_hover_color="#2E3744",
-    dropdown_fg_color="#13161C",
-    dropdown_hover_color="#1D222A",
-    font=ctk.CTkFont(family="Segoe UI Variable Text", size=11),
+    hover_color="#2E3744",
     text_color="#D1D5DB",
+    font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+    command=click_calendario_principal,
 )
-selector_dia.pack(side="right", padx=(0, 4), pady=3)
+btn_calendario.pack(side="right", padx=(0, 4), pady=3)
 
+# FOOTER: ENGRANE (IZQ) | PENDIENTES (DER)
 footer = ctk.CTkFrame(app, fg_color="transparent", height=28)
 footer.pack(side="bottom", fill="x", padx=16, pady=(0, 10))
 
 btn_ajustes = ctk.CTkButton(
     footer,
     text="⚙",
-    width=24,
-    height=24,
+    width=26,
+    height=26,
     corner_radius=6,
     fg_color="transparent",
     text_color="#6B7280",
@@ -1228,8 +2957,17 @@ macro_tareas = ctk.CTkScrollableFrame(
 )
 macro_tareas.pack(fill="both", expand=True, padx=14, pady=(4, 6))
 
-cargar_tareas()
-aplicar_tema(tema_actual)
-verificar_recordatorios()
+if __name__ == "__main__":
+    cargar_tareas()
+    ultimo_dia_verificado["dia"] = datetime.now().date()
+    aplicar_tema(tema_actual)
+    verificar_recordatorios()
+    inicializar_tray()
 
-app.mainloop()
+    # Comprobación sutil de actualizaciones al inicio (en segundo plano)
+    app.after(3000, lambda: verificar_actualizaciones(mostrar_si_al_dia=False))
+
+    if "--tray" in sys.argv:
+        app.withdraw()
+
+    app.mainloop()
